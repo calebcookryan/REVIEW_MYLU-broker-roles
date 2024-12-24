@@ -1,0 +1,1191 @@
+---
+title: "broker_roles_forreview"
+author: "calebryan"
+date: "2024-12-23"
+output: html_document
+---
+
+*Code for the analysis of the manuscript:"Individuals with broker roles structure the social organization of an endangered bat increasing the vulnerability of recovering populations to additional losses"*
+
+*Note on data availability*
+The provided code here does not include the pre-processing of raw data into day-roost groups but instead begins at day roost assignments for each individual included in the final analysis that sufficiently meets the required cutoff. Day group date was obfuscated maintaining the day-group structure but altering the name of the date. These data were collected as part of a long term monitoring program supporting multiple ongoing research projects and as a result raw data is not published alongside this manuscript however can be made available upon reasonable request.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load required packages
+```{r}
+#install.packages(c("ggplot2","asnipe","igraph","data.table","assortnet","spatsoc","rgexf","lubridate","chron","dplyr", "tidyr"))
+library(ggplot2)
+library(asnipe)
+library(igraph)
+library(data.table)
+library(assortnet)
+library(spatsoc)
+library(rgexf)
+library(lubridate)
+library(dplyr)
+library(tidyr)
+library(wrMisc)
+library(forcats)
+```
+
+Load data
+```{r}
+individual_cutoff = read.csv("broker_roles_data_forreview.csv")
+```
+
+Create network objects for each year and site and create table of network summary statistics for each year site network 
+(Figure 1)
+```{r echo = T}
+years <- c(2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024)
+site_list <- c("pinery_provincial_park", "salmonier_nature_park")  
+
+# Initialize a list to store all data and summary stats
+allindidata <- list()
+summary_stats <- list()
+
+# Loop over each year and site
+for (year in years) {
+  for (site in site_list) {
+    # Filter the data for the current year and sites in site_list
+    mysubset <- individual_cutoff %>%
+      filter(reader_year == year, reader_site1 == site)
+    
+    # Only proceed if mysubset has rows, to avoid errors
+    if (nrow(mysubset) > 0) {
+      
+      # Create the daygroup column
+      mysubset$daygroup <- as.factor(paste(mysubset$daygroup_date, mysubset$reader_site2, sep = "_"))
+      
+      # Select and rename columns
+      individuals <- mysubset %>%
+        select(bat, daygroup, daygroup_date) %>%
+        rename(c("ID" = "bat", "group" = "daygroup", "day" = "daygroup_date"))
+      
+      # Get the group-by-individual matrix
+      sampleGBI <- asnipe::get_group_by_individual(as.data.frame(individuals), data_format = "individuals")
+      
+      # Create the social network
+      network <- asnipe::get_network(sampleGBI, data_format = "GBI", association_index = "SRI")
+      
+      # Convert to graph object
+      graph_object <- igraph::graph.adjacency(network, mode = "undirected", diag = FALSE, weighted = TRUE)
+      
+      # Calculate degree and centrality betweenness
+      values <- as.data.frame(degree(graph_object)) %>%
+        rename(degree = "degree(graph_object)")
+      
+      # Calculate normalized betweenness centrality
+      values$cb <- centr_betw(graph_object)$res
+      max_cb <- max(values$cb, na.rm = TRUE)  # Maximum betweenness centrality
+      values$cb_normalized <- values$cb / max_cb  # Normalize cb
+      
+      # Add PIT column
+      values$pit <- rownames(values)
+      # Calculate CV values
+      CVlist <- as.data.frame(rowCVs(network)) %>%
+        rename(CV = "rowCVs(network)")
+      CVlist$pit <- rownames(CVlist)
+      
+      # Merge the tables
+      allvalues <- merge(values, CVlist, by = "pit")
+      allvalues$reader_year <- year
+      
+      # Append to allindidata list
+      allindidata[[year]] <- allvalues
+      
+      # Summary statistics for the current year and site
+      summary_stats[[year]] <- allvalues %>%
+        summarise(
+          mean_degree = mean(degree),
+          sd_degree = sd(degree),
+          median_degree = median(degree),
+          mean_cb = mean(cb),
+          sd_cb = sd(cb),
+          median_cb = median(cb),
+          mean_cb_normalized = mean(cb_normalized),  # Include normalized cb stats
+          sd_cb_normalized = sd(cb_normalized),      # Include normalized cb stats
+          median_cb_normalized = median(cb_normalized)  # Include normalized cb stats
+        ) %>%
+        mutate(reader_year = year) %>%
+        mutate(reader_area = site) %>%
+        mutate(network_size = length(graph_object))
+      
+      # Save the network as a CSV file with the year and site name
+      site_name <- unique(mysubset$reader_site1)
+      file_name <- paste0("finalnetwork_", site_name, "_", year, ".csv")
+      write.csv(network, file = file_name)
+    }
+  }
+}
+
+# Combine all data into a single data frame
+allindidata <- do.call(rbind, allindidata)
+
+# Combine summary stats into a single data frame
+summary_stats <- do.call(rbind, summary_stats)
+
+# Save the full data and summary stats
+save(allindidata, file = "allindidata.RDATA")
+write.csv(summary_stats, file = "summary_stats.csv")  # Save summary stats as CSV
+print(summary_stats)
+```
+
+
+Calculate repeatability of individual betweeness centrality across years 
+```{r}
+#Salmonier (pre-white-nose syndrome) 
+# Calculate repeatability for cb_normalized
+# Filter for individuals present in multiple years
+repeatability_data <- allindidata %>%
+  filter(reader_year <= 2021) %>%
+  group_by(pit) %>%
+  filter(n_distinct(reader_year) > 3) %>% # Only include individuals present in >2 year
+  ungroup()%>%
+  group_by(reader_year) %>%
+  mutate(rank_cb = rank(cb_normalized, na.last = "keep")) %>% # Rank within year
+  ungroup() 
+
+# Variance components
+mean_individual_cb <- repeatability_data %>%
+  group_by(pit) %>%
+  summarise(mean_cb_normalized = mean(cb_normalized, na.rm = TRUE))  # Mean per individual 
+
+
+between_variance <- var(mean_individual_cb$mean_cb_normalized, na.rm = TRUE)  # Variance among individuals
+
+within_variance <- repeatability_data %>%
+  group_by(pit) %>%
+  summarise(var_within = var(cb_normalized, na.rm = TRUE)) %>%
+  summarise(mean_var_within = mean(var_within, na.rm = TRUE)) %>%
+  pull(mean_var_within)  # Mean variance within individuals
+
+
+# Calculate repeatability
+repeatability <- between_variance / (between_variance + within_variance)
+cat("Repeatability (R) SNP:", repeatability, "\n")
+
+
+
+# Permutation test
+set.seed(123)  # For reproducibility
+n_permutations <- 10000
+permuted_repeatability <- replicate(n_permutations, {
+  shuffled_cb <- sample(repeatability_data$cb_normalized)
+  repeatability_data$shuffled_cb <- shuffled_cb
+  
+  # Recalculate variance components
+  mean_individual_cb_perm <- repeatability_data %>%
+    group_by(pit) %>%
+    summarise(mean_cb_normalized = mean(shuffled_cb, na.rm = TRUE))
+  
+  between_variance_perm <- var(mean_individual_cb_perm$mean_cb_normalized, na.rm = TRUE)
+  
+  within_variance_perm <- repeatability_data %>%
+    group_by(pit) %>%
+    summarise(var_within = var(shuffled_cb, na.rm = TRUE)) %>%
+    summarise(mean_var_within = mean(var_within, na.rm = TRUE)) %>%
+    pull(mean_var_within)
+  
+  between_variance_perm / (between_variance_perm + within_variance_perm)
+})
+
+# Calculate p-value
+p_value <- mean(abs(permuted_repeatability) >= abs(repeatability))
+cat("Permutation Test p-value SNP:", p_value, "\n")
+
+#Pinery (post-white-nose syndrome) 
+# Calculate repeatability for cb_normalized
+# Filter for individuals present in multiple years
+repeatability_data <- allindidata %>%
+  filter(reader_year > 2021) %>%
+  group_by(pit) %>%
+  filter(n_distinct(reader_year) > 2) %>% # Only include individuals present in >2 years at pinery
+  ungroup()%>%
+  group_by(reader_year) %>% 
+  mutate(rank_cb = rank(cb_normalized, na.last = "keep")) %>% # Rank within year
+  ungroup() 
+
+# Variance components
+mean_individual_cb <- repeatability_data %>%
+  group_by(pit) %>%
+  summarise(mean_cb_normalized = mean(cb_normalized, na.rm = TRUE))  # Mean per individual 
+  
+
+between_variance <- var(mean_individual_cb$mean_cb_normalized, na.rm = TRUE)  # Variance among individuals
+
+within_variance <- repeatability_data %>%
+  group_by(pit) %>%
+  summarise(var_within = var(cb_normalized, na.rm = TRUE)) %>%
+  summarise(mean_var_within = mean(var_within, na.rm = TRUE)) %>%
+  pull(mean_var_within)  # Mean variance within individuals
+
+# Calculate repeatability
+repeatability <- between_variance / (between_variance + within_variance)
+cat("Repeatability (R) ppp:", repeatability, "\n")
+
+
+# Permutation test
+set.seed(123)  # For reproducibility
+n_permutations <- 10000
+permuted_repeatability <- replicate(n_permutations, {
+  shuffled_cb <- sample(repeatability_data$cb_normalized)
+  repeatability_data$shuffled_cb <- shuffled_cb
+  
+  # Recalculate variance components
+  mean_individual_cb_perm <- repeatability_data %>%
+    group_by(pit) %>%
+    summarise(mean_cb_normalized = mean(shuffled_cb, na.rm = TRUE))
+  
+  between_variance_perm <- var(mean_individual_cb_perm$mean_cb_normalized, na.rm = TRUE)
+  
+  within_variance_perm <- repeatability_data %>%
+    group_by(pit) %>%
+    summarise(var_within = var(shuffled_cb, na.rm = TRUE)) %>%
+    summarise(mean_var_within = mean(var_within, na.rm = TRUE)) %>%
+    pull(mean_var_within)
+  
+  between_variance_perm / (between_variance_perm + within_variance_perm)
+})
+
+# Calculate p-value
+p_value <- mean(abs(permuted_repeatability) >= abs(repeatability))
+cat("Permutation Test p-value ppp:", p_value, "\n")
+
+```
+
+Create individual betweenness centrality repeatability histograms
+(Figure 2 + supplemental)
+```{r}
+pitlist_snp = individual_cutoff %>%
+  filter(reader_site1 == "salmonier_nature_park") %>%
+  distinct(bat)
+
+pitlist_ppp = individual_cutoff %>%
+  filter(reader_site1 == "pinery_provincial_park") %>%
+  distinct(bat)
+allindidata$bat = allindidata$pit
+
+#Salmonier
+#Individual boxplots for variation in betweness centrality
+dataa = allindidata[allindidata$bat %in% pitlist_snp$bat,]
+
+data = dataa %>% 
+  filter(reader_year >= 2016) %>%
+  group_by(bat) %>% 
+  dplyr::mutate(num_years=n()) %>% 
+  mutate(meancb_normalized = mean(cb_normalized))%>%
+  ungroup() %>%
+  filter(num_years >= 3)  #filter to only include individuals found in at least 3 years
+
+pop_cb_normalized_mean = mean(data$cb_normalized)
+
+indi_var_cb_normalized_snp <- data %>% 
+  mutate(bat = fct_reorder(bat, cb_normalized, .fun = 'mean')) %>% 
+  group_by(bat) %>% 
+  summarise(
+    min_cb = min(cb_normalized),
+    max_cb = max(cb_normalized),
+    mean_cb = mean(cb_normalized)
+  ) %>% 
+  ggplot(aes(y = reorder(bat, mean_cb))) + 
+  geom_linerange(aes(xmin = min_cb, xmax = max_cb), color = "gray60", size = 0.5) + # Line through max and min
+  geom_point(aes(x = mean_cb, color = ifelse(mean_cb < pop_cb_normalized_mean, '#4E79A7','#E15759')), 
+             shape = 3, size = 2, stroke = 1.2) + # "X" for mean
+  theme(
+    axis.text.y = element_blank(),  # Adjust label size
+    axis.ticks.y = element_blank(), 
+    axis.title.y = element_text(size = 18),
+    axis.title.x = element_text(size = 18),
+    axis.text.x = element_text(size = 12), 
+    legend.position = "none", 
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(), 
+    axis.line = element_line(colour = "black"),
+    plot.margin = margin(t = 20, r = 10, b = 10, l = 15)  # Increased top margin
+  ) + 
+  xlab(expression("Betweenness Centrality"[Normal])) + 
+  ylab("Individual") + 
+  geom_vline(xintercept = pop_cb_normalized_mean, linetype = "dotted", color = "black", size = 1) + 
+  scale_color_identity() +
+  coord_cartesian(clip = "off") 
+
+print(indi_var_cb_normalized_snp)
+ggsave("indi_var_cb_normalized_snp.tiff", plot = indi_var_cb_normalized_snp,
+       width = 7, 
+       height = 7,  
+       dpi = 600, #resolution
+       device = "tiff")   
+ggsave("indi_var_cb_normalized_snp.png", plot = indi_var_cb_normalized_snp)    
+
+#Pinery
+
+ppp_data_boxplot = allindidata[allindidata$bat %in% pitlist_ppp$bat,]
+
+
+data = ppp_data_boxplot %>% 
+  filter(reader_year >= 2022) %>%
+  group_by(pit) %>% 
+  dplyr::mutate(num_years=n()) %>% 
+  mutate(meancb_normalized = mean(cb_normalized))%>%
+  filter(num_years >= 2) %>% #filter to only include individuals included in at least two years
+  ungroup()
+
+pop_cb_normalized_mean = mean(data$cb_normalized)
+
+indi_var_cb_normalized_ppp <- data %>% 
+  mutate(bat = fct_reorder(bat, cb_normalized, .fun = 'mean')) %>% 
+  group_by(bat) %>% 
+  summarise(
+    min_cb = min(cb_normalized),
+    max_cb = max(cb_normalized),
+    mean_cb = mean(cb_normalized)
+  ) %>% 
+  ggplot(aes(y = reorder(bat, mean_cb))) + 
+  geom_linerange(aes(xmin = min_cb, xmax = max_cb), color = "gray60", size = 0.5) + # Line through max and min
+  geom_point(aes(x = mean_cb, color = ifelse(mean_cb < pop_cb_normalized_mean, '#4E79A7', '#E15759')), 
+             shape = 3, size = 2, stroke = 1.2) + # "X" for mean
+  theme(
+    axis.text.y = element_blank(),  # Adjust label size
+    axis.ticks.y = element_blank(), 
+    axis.title.y = element_text(size = 18),
+    axis.title.x = element_text(size = 18),
+    axis.text.x = element_text(size = 12),
+    legend.position = "none", 
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(), 
+    axis.line = element_line(colour = "black"),
+    plot.margin = margin(t = 20, r = 10, b = 10, l = 15)  # Increased top margin
+  ) + 
+  xlab(expression("Betweenness Centrality"[Normal])) + 
+  ylab("Individual") + 
+  geom_vline(xintercept = pop_cb_normalized_mean, linetype = "dotted", color = "black", size = 1) + 
+  scale_color_identity() +
+  coord_cartesian(clip = "off") 
+ 
+print(indi_var_cb_normalized_ppp)
+ggsave("indi_var_cb_normalized_ppp.tiff", plot = indi_var_cb_normalized_ppp,
+       width = 7, 
+       height = 7,  
+       dpi = 600, #resolution
+       device = "tiff")   
+ggsave("indi_var_cb_normalized_ppp.png", plot = indi_var_cb_normalized_ppp)  
+
+```
+
+Iterate through topological knockouts (w) for each yearly association network. **w=50** 
+```{r}
+#Salmonier
+knockout_total = 50
+
+start_time <- Sys.time()
+knockout_table <- list()
+net_matrix <- list()
+bats <- list()
+year_list = list(2016, 2017, 2018, 2019, 2021)
+
+allindidata_snp = allindidata %>%
+  filter(reader_year >= 2016) %>%
+  filter(reader_year <= 2021)
+
+for (y in year_list){
+        mysubset<- individual_cutoff %>% 
+          filter((reader_year== y)) %>%
+          filter((reader_site1=="salmonier_nature_park"))
+        mysubset$daygroup<-paste(mysubset$reader_site2, "-", mysubset$daygroup_date)
+        individuals = mysubset %>%
+          dplyr::rename (ID = bat, group = daygroup, day = daygroup_date) %>%
+          dplyr::select (ID,group,day)
+
+        individuals = data.frame(individuals)
+        individuals$day = (individuals$day)
+          
+        gbiLs <- get_group_by_individual(individuals, data_format = "individuals")
+        net_matrix[[y]] <- get_network(gbiLs,data_format="GBI",association_index="SRI")
+        bats[y] = length(unique(mysubset$bat))
+        graph_object_for_cb = graph_from_adjacency_matrix(net_matrix[[y]],mode="undirected",diag=FALSE,weighted=TRUE)
+
+}
+  for (w in 1:knockout_total){
+  
+   
+    #declare summary stat lists
+    Q <-  vector(mode = "list", length = length(year_list))
+    pQ <-  vector(mode = "list", length = length(year_list))
+    pSRI <-  vector(mode = "list", length = length(year_list))
+    rc <-  vector(mode = "list", length = length(year_list))
+    ncom <- vector(mode = "list", length = length(year_list))
+    efficency <-  vector(mode = "list", length = length(year_list))
+    eff_normal <-  vector(mode = "list", length = length(year_list))
+    max_effrand <-  vector(mode = "list", length = length(year_list))
+    min_effrand <-  vector(mode = "list", length = length(year_list))
+    pefficency <- vector(mode = "list", length = length(year_list))
+    transistivity <-  vector(mode = "list", length = length(year_list))
+    ptransistivity <-  vector(mode = "list", length = length(year_list))
+    year <-  vector(mode = "list", length = length(year_list))
+    effact <-  vector(mode = "list", length = length(year_list))
+    Qact <- vector(mode = "list", length = length(year_list))
+    transact <-  vector(mode = "list", length = length(year_list))
+    knockoutnum <- vector(mode = "list", length = length(year_list))
+    cvactual <-  vector(mode = "list", length = length(year_list))
+    peff <-  vector(mode = "list", length = length(year_list))
+    ptrans<-  vector(mode = "list", length = length(year_list))
+    n <- vector(mode = "list", length = length(year_list))
+
+      for (y in year_list){
+        graph_object_for_cb = graph_from_adjacency_matrix(net_matrix[[y]],mode="undirected",diag=FALSE,weighted=TRUE)
+        knockout_stats<-as.data.frame(degree(graph_object_for_cb)) %>% dplyr::rename(degree="degree(graph_object_for_cb)")
+        knockout_stats$cb<-centr_betw(graph_object_for_cb)$res
+        knockout_stats$pit<-rownames(knockout_stats)
+        
+        importantbatsa  = knockout_stats %>% arrange(desc(cb))  %>% slice(1:w) 
+        importantbats = as.list(importantbatsa$pit)
+       
+       
+        
+        #
+        #list of pits
+        pitlist = unique(mysubset$bat)
+        
+        rand_net_matrix <- list()
+        Qrand <- list()
+        effrand <-list()
+        transrand <- list()
+        meanrand <- list()
+        sdrand <- list()
+        cvrand <- list()
+        
+      
+          for (i in 1:100) {
+          randompits<- sample(pitlist, w)
+          rand_net_matrix <- net_matrix[[y]][!rownames(net_matrix[[y]]) %in% randompits, !colnames(net_matrix[[y]]) %in% randompits]
+          rand_graph_object <- graph_from_adjacency_matrix(rand_net_matrix,mode="undirected",diag=FALSE,weighted=TRUE)
+          Qrand[i]<-modularity(cluster_fast_greedy(rand_graph_object))
+          effrand[i] = global_efficiency(rand_graph_object , weights = NULL, directed = FALSE)
+          transrand[i] = transitivity(rand_graph_object , weights = NULL, type = "global")
+          meanrand[i]<-mean(rand_net_matrix)
+          sdrand[i]<-sd(rand_net_matrix)
+          
+          #calculate CV for SRI
+          #note, sd = mean of the squared differences which is why this value can be greater than 1
+          cvrand[i]<-(sd(rand_net_matrix)/mean(rand_net_matrix))*100
+        
+        }
+       
+         
+      #calculate actual Q value
+      actual_net_matrix <- net_matrix[[y]][!rownames(net_matrix[[y]]) %in% importantbats, !colnames(net_matrix[[y]]) %in% importantbats]
+      graph_object <- graph_from_adjacency_matrix(actual_net_matrix,mode="undirected",diag=FALSE,weighted=TRUE)
+      n[y] = as.numeric(length(graph_object))
+      Qact[y]<-modularity(cluster_fast_greedy(graph_object))
+      effact[y] = global_efficiency(graph_object , weights = NULL, directed = FALSE)
+      eff_normal[y] = (global_efficiency(graph_object , weights = NULL, directed = FALSE))/(global_efficiency(graph_object_for_cb , weights = NULL, directed = FALSE))
+      transact[y] = transitivity(graph_object , weights = NULL, type = "global")
+      #compare actual Q value to distribution of random Q values to generate p value
+      Qrand = data.frame(Qrand)
+      x<-sum(Qrand >= Qact[y])
+      pQ[y]<-x/length(Qrand)
+      effrand = (data.frame(effrand))/(global_efficiency(graph_object_for_cb , weights = NULL, directed = FALSE))
+      bb = t(effrand)
+      cc <- data.frame(value = bb[, 1], row_name = rownames(bb))
+      rownames(cc) <- NULL
+      max_effrand[y] = quantile(cc$value, 0.75)
+      min_effrand[y] = quantile(cc$value, 0.25)
+      ya<-sum(effrand >= effact[y])
+      peff[y]<-ya/length(effrand)
+      transrand = data.frame(transrand)
+      z<-sum(transrand >= transact[y])
+      ptrans[y]<-z/length(transrand)
+      
+      
+      #calculate cvSRI for each random network
+      SRI2<-as.data.table(meanrand)
+      sdran2<-as.data.table(sdrand)
+      cvran<-(sdran2/SRI2)*100
+      cvranfinal<-t(cvran)
+      
+      #calculate cvSRI of actual network
+      actualmean<-mean(net_matrix[[y]])
+      sdactual<-sd(net_matrix[[y]])
+      
+      #calculate CV for SRI
+      #note, sd = mean of the squared differences which is why this value can be greater than 1
+      cvactual[y]<-(sd(net_matrix[[y]])/mean(net_matrix[[y]]))*100
+      
+      #compare actual CV SRI to distribution of random values to generate p value
+      x<-sum(cvranfinal >= cvactual[y])
+      pSRI[y]<-x/length(cvranfinal)
+    
+      year[y] = y
+      knockoutnum[y] = w 
+      }
+
+    Q <- unlist(Qact[c(2016:2019,2021)])
+    pQ<-  unlist(pQ[c(2016:2019,2021)])
+    efficency<-  unlist(effact[c(2016:2019,2021)])
+    eff_normal<-  unlist(eff_normal[c(2016:2019,2021)])
+    pefficency<-  unlist(peff[c(2016:2019,2021)])
+    rand_eff_75 <- unlist(max_effrand[c(2016:2019,2021)])
+    rand_eff_25 <-unlist(min_effrand[c(2016:2019,2021)])
+    transistivity<-unlist(transact[c(2016:2019,2021)])
+    ptransistivity<-unlist(ptrans[c(2016:2019,2021)])
+    year<-unlist(year[c(2016:2019,2021)])
+    knockoutnum<-unlist(knockoutnum[c(2016:2019,2021)])
+    cvactual<-unlist(cvactual[c(2016:2019,2021)])
+    n<-unlist(n[c(2016:2019,2021)])
+
+  
+    knockout_table[[w]]<- data.frame(Q, pQ, efficency ,eff_normal, n, pefficency, rand_eff_25 , rand_eff_75, transistivity , ptransistivity , year , knockoutnum , cvactual)
+  }
+knockout_table_snp = rbindlist(knockout_table, use.names = FALSE)
+save(knockout_table_snp, file = "knockout_table_snp.RDATA")
+
+#Pinery networks and tables Iterate through topological knockouts (w) for each yearly association network. 
+# Pinery networks and tables iterate through topological knockouts (w) for each yearly association network.
+knockout_total <- 50
+knockout_table <- list()
+net_matrix <- list()
+bats <- list()
+n <- list()
+
+# Updated year list for Pinery
+year_list <- list(2022, 2023, 2024)
+
+for (y in year_list) {
+  mysubset <- individual_cutoff %>%
+    filter((reader_year == y))
+  mysubset$daygroup <- paste(mysubset$reader_site2, "-", mysubset$daygroup_date)
+  individuals <- mysubset %>%
+    dplyr::rename(ID = bat, group = daygroup, day = daygroup_date) %>%
+    dplyr::select(ID, group, day)
+  
+  # Apply filter
+  individuals <- data.frame(individuals)
+  gbiLs <- get_group_by_individual(individuals, data_format = "individuals")
+  net_matrix[[y]] <- get_network(gbiLs, data_format = "GBI", association_index = "SRI")
+  bats[y] <- length(unique(mysubset$bat))
+  graph_object_for_cb <- graph.adjacency(net_matrix[[y]], mode = "undirected", diag = FALSE, weighted = TRUE)
+}
+
+for (w in 1:knockout_total) {
+  # Declare summary stat lists
+  Q <- vector(mode = "list", length = length(year_list))
+  pQ <- vector(mode = "list", length = length(year_list))
+  pSRI <- vector(mode = "list", length = length(year_list))
+  rc <- vector(mode = "list", length = length(year_list))
+  ncom <- vector(mode = "list", length = length(year_list))
+  efficency <- vector(mode = "list", length = length(year_list))
+  eff_normal <- vector(mode = "list", length = length(year_list))
+  algebraic_connectivity <- vector(mode = "list", length = length(year_list))
+  max_effrand <- vector(mode = "list", length = length(year_list))
+  min_effrand <- vector(mode = "list", length = length(year_list))
+  pefficency <- vector(mode = "list", length = length(year_list))
+  transistivity <- vector(mode = "list", length = length(year_list))
+  ptransistivity <- vector(mode = "list", length = length(year_list))
+  year <- vector(mode = "list", length = length(year_list))
+  effact <- vector(mode = "list", length = length(year_list))
+  Qact <- vector(mode = "list", length = length(year_list))
+  transact <- vector(mode = "list", length = length(year_list))
+  knockoutnum <- vector(mode = "list", length = length(year_list))
+  cvactual <- vector(mode = "list", length = length(year_list))
+  peff <- vector(mode = "list", length = length(year_list))
+  ptrans <- vector(mode = "list", length = length(year_list))
+  n <- vector(mode = "list", length = length(year_list))
+  
+  for (y in year_list) {
+    graph_object_for_cb <- graph.adjacency(net_matrix[[y]], mode = "undirected", diag = FALSE, weighted = TRUE)
+    knockout_stats <- as.data.frame(degree(graph_object_for_cb)) %>%
+      dplyr::rename(degree = "degree(graph_object_for_cb)")
+    knockout_stats$cb <- centr_betw(graph_object_for_cb)$res
+    knockout_stats$pit <- rownames(knockout_stats)
+    
+    importantbatsa <- knockout_stats %>% arrange(desc(cb)) %>% slice(1:w)
+    importantbats <- as.list(importantbatsa$pit)
+    
+    # List of pits
+    pitlist <- unique(mysubset$bat)
+    rand_net_matrix <- list()
+    Qrand <- list()
+    effrand <- list()
+    transrand <- list()
+    meanrand <- list()
+    sdrand <- list()
+    cvrand <- list()
+    
+    for (i in 1:100) {
+      randompits <- sample(pitlist, w)
+      rand_net_matrix <- net_matrix[[y]][!rownames(net_matrix[[y]]) %in% randompits, !colnames(net_matrix[[y]]) %in% randompits]
+      rand_graph_object <- graph.adjacency(rand_net_matrix, mode = "undirected", diag = FALSE, weighted = TRUE)
+      Qrand[i] <- modularity(cluster_fast_greedy(rand_graph_object))
+      effrand[i] <- global_efficiency(rand_graph_object, weights = NULL, directed = FALSE)
+      transrand[i] <- transitivity(rand_graph_object, weights = NULL, type = "global")
+      meanrand[i] <- mean(rand_net_matrix)
+      sdrand[i] <- sd(rand_net_matrix)
+      
+      # Calculate CV for SRI
+      cvrand[i] <- (sd(rand_net_matrix) / mean(rand_net_matrix)) * 100
+    }
+    
+    # Calculate actual Q value
+    actual_net_matrix <- net_matrix[[y]][!rownames(net_matrix[[y]]) %in% importantbats, !colnames(net_matrix[[y]]) %in% importantbats]
+    graph_object <- graph.adjacency(actual_net_matrix, mode = "undirected", diag = FALSE, weighted = TRUE)
+    n[y] <- as.numeric(length(graph_object))
+    Qact[y] <- modularity(cluster_fast_greedy(graph_object))
+    effact[y] <- global_efficiency(graph_object, weights = NULL, directed = FALSE)
+    L <- laplacian_matrix(graph_object)
+    eigenvalues <- eigen(L)$values
+    sorted_eigenvalues <- sort(eigenvalues)
+    algebraic_connectivity[y] <- sorted_eigenvalues[2]
+    eff_normal[y] <- global_efficiency(graph_object, weights = NULL, directed = FALSE) /
+      global_efficiency(graph_object_for_cb, weights = NULL, directed = FALSE)
+    transact[y] <- transitivity(graph_object, weights = NULL, type = "global")
+    
+    # Generate p-values and calculate CV SRI
+    Qrand <- data.frame(Qrand)
+    x <- sum(Qrand >= Qact[y])
+    pQ[y] <- x / length(Qrand)
+    effrand <- data.frame(effrand)
+    bb <- t(effrand)
+    cc <- data.frame(value = bb[, 1], row_name = rownames(bb))
+    rownames(cc) <- NULL
+    max_effrand[y] <- quantile(cc$value, 0.75) / global_efficiency(graph_object_for_cb, weights = NULL, directed = FALSE)
+    min_effrand[y] <- quantile(cc$value, 0.25) / global_efficiency(graph_object_for_cb, weights = NULL, directed = FALSE)
+    ya <- sum(effrand >= effact[y])
+    peff[y] <- ya / length(effrand)
+    transrand <- data.frame(transrand)
+    z <- sum(transrand >= transact[y])
+    ptrans[y] <- z / length(transrand)
+    
+    # Calculate CV SRI
+    SRI2 <- as.data.table(meanrand)
+    sdran2 <- as.data.table(sdrand)
+    cvran <- (sdran2 / SRI2) * 100
+    cvranfinal <- t(cvran)
+    cvactual[y] <- (sd(net_matrix[[y]]) / mean(net_matrix[[y]])) * 100
+    x <- sum(cvranfinal >= cvactual[y])
+    pSRI[y] <- x / length(cvranfinal)
+    
+    year[y] <- y
+    knockoutnum[y] <- w
+  }
+  
+  # Collect results
+  Q <- unlist(Qact[2022:2024])
+  pQ <- unlist(pQ[2022:2024])
+  efficency <- unlist(effact[2022:2024])
+  eff_normal <- unlist(eff_normal[2022:2024])
+  algebraic_connectivity <- unlist(algebraic_connectivity[2022:2024])
+  pefficency <- unlist(peff[2022:2024])
+  rand_eff_75 <- unlist(max_effrand[2022:2024])
+  rand_eff_25 <- unlist(min_effrand[2022:2024])
+  transistivity <- unlist(transact[2022:2024])
+  ptransistivity <- unlist(ptrans[2022:2024])
+  year <- unlist(year[2022:2024])
+  knockoutnum <- unlist(knockoutnum[2022:2024])
+  cvactual <- unlist(cvactual[2022:2024])
+  n <- unlist(n[2022:2024])
+  
+  knockout_table[[w]] <- data.frame(
+    Q, pQ, efficency, eff_normal, algebraic_connectivity, n,
+    pefficency, rand_eff_25, rand_eff_75, transistivity, ptransistivity,
+    year, knockoutnum, cvactual
+  )
+}
+
+knockout_table_ppp <- rbindlist(knockout_table, use.names = FALSE)
+save(knockout_table_ppp, file = "knockout_table_ppp.RDATA")
+```
+
+Create plots of normalized efficiency for each network following topological knockouts  
+(Figure 3)
+```{r, echo = FALSE}
+individual_cutoff<- day_records_brokerroles %>% 
+  group_by(bat,reader_year) %>% 
+  mutate(n=n()) %>% 
+  filter(n >= 2) %>%     #filter out based on cutoff of number of days minimum in a year to include in network
+  ungroup() %>%
+  arrange(bat) 
+
+# Create and initialize the no_knocks_ppp data frame
+no_knocks_ppp <- data.frame()
+no_knocks_ppp[1, 1] <- 2022
+no_knocks_ppp[2, 1] <- 2023
+no_knocks_ppp[3, 1] <- 2024
+no_knocks_ppp[1, 2:6] <- c(0, NA, NA, 1, 1)
+no_knocks_ppp[2, 2:6] <- c(0, NA, NA, 1, 1)
+no_knocks_ppp[3, 2:6] <- c(0, NA, NA, 1, 1)
+
+# Calculate efficiency and normalization for each year
+# 2022
+eff_2022 <- global_efficiency(
+  graph.adjacency(net_matrix[[2022]], mode = "undirected", diag = FALSE, weighted = TRUE), 
+  weights = NULL, 
+  directed = FALSE
+)
+eff_normal_2022 <- eff_2022 / eff_2022
+L_2022 <- laplacian_matrix(graph.adjacency(net_matrix[[2022]], mode = "undirected", diag = FALSE, weighted = TRUE))
+eigenvalues_2022 <- eigen(L_2022)$values
+sorted_eigenvalues_2022 <- sort(eigenvalues_2022)
+algebraic_connectivity_2022 <- sorted_eigenvalues_2022[2]
+no_knocks_ppp[1, 3:4] <- c(eff_2022, eff_normal_2022)
+
+# 2023
+eff_2023 <- global_efficiency(
+  graph.adjacency(net_matrix[[2023]], mode = "undirected", diag = FALSE, weighted = TRUE), 
+  weights = NULL, 
+  directed = FALSE
+)
+eff_normal_2023 <- eff_2023 / eff_2023
+L_2023 <- laplacian_matrix(graph.adjacency(net_matrix[[2023]], mode = "undirected", diag = FALSE, weighted = TRUE))
+eigenvalues_2023 <- eigen(L_2023)$values
+sorted_eigenvalues_2023 <- sort(eigenvalues_2023)
+algebraic_connectivity_2023 <- sorted_eigenvalues_2023[2]
+no_knocks_ppp[2, 3:4] <- c(eff_2023, eff_normal_2023)
+
+# 2024
+eff_2024 <- global_efficiency(
+  graph.adjacency(net_matrix[[2024]], mode = "undirected", diag = FALSE, weighted = TRUE), 
+  weights = NULL, 
+  directed = FALSE
+)
+eff_normal_2024 <- eff_2024 / eff_2024
+L_2024 <- laplacian_matrix(graph.adjacency(net_matrix[[2024]], mode = "undirected", diag = FALSE, weighted = TRUE))
+eigenvalues_2024 <- eigen(L_2024)$values
+sorted_eigenvalues_2024 <- sort(eigenvalues_2024)
+algebraic_connectivity_2024 <- sorted_eigenvalues_2024[2]
+no_knocks_ppp[3, 3:4] <- c(eff_2024, eff_normal_2024)
+
+# Set column names for no_knocks_ppp
+colnames(no_knocks_ppp) <- c("year", "knockoutnum", "efficency", "eff_normal", "rand_eff_25", "rand_eff_75")
+
+# Process knockouts for each year
+# 2022
+knockout_2022 <- knockout_table_ppp %>%
+  filter(year == "2022")
+eff_2022_row <- no_knocks_ppp %>%
+  filter(year == 2022)
+knockout_2022$eff_normal <- knockout_2022$efficency / eff_2022_row$efficency
+
+# 2023
+knockout_2023 <- knockout_table_ppp %>%
+  filter(year == "2023")
+eff_2023_row <- no_knocks_ppp %>%
+  filter(year == 2023)
+knockout_2023$eff_normal <- knockout_2023$efficency / eff_2023_row$efficency
+
+# 2024
+knockout_2024 <- knockout_table_ppp %>%
+  filter(year == "2024")
+eff_2024_row <- no_knocks_ppp %>%
+  filter(year == 2024)
+knockout_2024$eff_normal <- knockout_2024$efficency / eff_2024_row$efficency
+
+# Combine knockout data
+ppp_knocks_efficency <- rbind(knockout_2022, knockout_2023, knockout_2024)
+
+# Combine no_knocks_ppp with knockouts
+# Ensure both data frames have the same structure
+ppp_knocks_efficency <- ppp_knocks_efficency %>%
+  select(year, knockoutnum, efficency,eff_normal,rand_eff_25,rand_eff_75)
+
+
+# Combine the two data frames
+ppp_eff_plot <- rbind(no_knocks_ppp, ppp_knocks_efficency)
+
+# Ensure column names are exactly from no_knocks_ppp
+colnames(ppp_eff_plot) <- colnames(no_knocks_ppp)
+
+# Create the efficiency scatter plot
+efficency_scatterplot_ppp_color <- ppp_eff_plot %>%
+  ggplot(aes(x = knockoutnum, y = eff_normal, group = year, color = as.factor(year))) + 
+  geom_path(linetype = 1) +
+  geom_ribbon(
+    linetype = 2, 
+    aes(ymin = rand_eff_25, ymax = rand_eff_75, fill = as.factor(year)), 
+    alpha = 0.2
+  ) +
+  scale_color_manual(
+    values = c("2022" = "#E15759", "2023" = "#4E79A7", "2024" = "#009E73"), 
+    labels = c("2022" = "2022", "2023" = "2023", "2024" = "2024")
+  ) + 
+  scale_fill_manual(
+    values = c("2022" = "#E15759", "2023" = "#4E79A7", "2024" = "#009E73"), 
+    labels = c("2022" = "2022", "2023" = "2023", "2024" = "2024")
+  ) +
+  labs(
+    x = "Number of Knockouts", 
+    y = "Normalized Global Efficiency", 
+    color = "Year", 
+    fill = "Year"
+  ) +
+  theme(
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(), 
+    axis.line = element_line(colour = "black"),
+    text = element_text(family = "serif")
+  )
+
+# Display and save the plot
+print(efficency_scatterplot_ppp_color)
+ggsave("efficency_scatterplot_ppp_color.tiff", plot = efficency_scatterplot_ppp_color)   
+ggsave("efficency_scatterplot_ppp_color.png", plot = efficency_scatterplot_ppp_color) 
+
+efficency_scatterplot_ppp_bw <- ppp_eff_plot %>%
+  ggplot(aes(x = knockoutnum, y = eff_normal, group = year, linetype = as.factor(year))) + 
+  geom_path(size = 1) + 
+  geom_ribbon(
+    aes(ymin = rand_eff_25, ymax = rand_eff_75, fill = as.factor(year)),
+    alpha = 0.2
+  ) +
+  scale_linetype_manual(
+    values = c("2022" = "solid", "2023" = "dashed", "2024" = "dotted"), 
+    labels = c("2022" = "2022", "2023" = "2023", "2024" = "2024")
+  ) + 
+  scale_fill_manual(
+    values = c("2022" = "gray70", "2023" = "gray50", "2024" = "gray30"), 
+    labels = c("2022" = "2022", "2023" = "2023", "2024" = "2024")
+  ) + 
+  labs(
+    x = "Number of Knockouts", 
+    y = "Normalized Global Efficiency", 
+    linetype = "Year", 
+    fill = "Year"
+  ) + 
+  theme(
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(), 
+    axis.line = element_line(colour = "black"),
+    text = element_text(family = "serif")
+  )
+
+efficency_scatterplot_ppp_bw
+
+# Display and save the plot
+print(efficency_scatterplot_ppp_bw)
+ggsave("efficency_scatterplot_ppp_bw.svg", plot = efficency_scatterplot_ppp_bw)   
+ggsave("efficency_scatterplot_ppp_bw.png", plot = efficency_scatterplot_ppp_bw)   
+
+
+##SNP
+no_knocks_snp <- data.frame(year = integer(),
+                             knockoutnum = integer(),
+                             n = integer(),
+                             efficiency = numeric(),
+                             eff_normal = numeric(),
+                            rand_eff_25 = numeric(), 
+                            rand_eff_75 = numeric())
+
+year_list <- c(2016, 2017, 2018, 2019, 2021)
+
+for (year in year_list) {
+  mysubset <- individual_cutoff%>% 
+    filter(reader_year == year) %>%
+    filter((reader_site1=="salmonier_nature_park"))
+  
+  mysubset$daygroup <- as.factor(paste(mysubset$daygroup_date, mysubset$reader_site2, sep="_"))
+  individuals <- mysubset %>% select(bat , daygroup, daygroup_date) %>% 
+    rename(ID = bat, group = daygroup, day = daygroup_date)
+  sampleGBI <- asnipe::get_group_by_individual(as.data.frame(individuals), data_format = "individuals")
+  snp_network <- asnipe::get_network(sampleGBI, data_format = "GBI", association_index = "SRI")
+  graph_object_snp <- graph.adjacency(snp_network, mode = "undirected", diag = FALSE, weighted = TRUE)
+  n = length(unique(mysubset$bat))
+  efficiency <- global_efficiency(graph_object_snp , weights = NULL, directed = FALSE) 
+  eff_normal = efficiency/efficiency
+  knockoutnum <- 0  
+  rand_eff_25 <- 1
+  rand_eff_75 <- 1  
+
+  
+  # Add results to the dataframe
+  no_knocks_snp <- rbind(no_knocks_snp, data.frame(year = year, knockoutnum = knockoutnum, n = n, efficiency = efficiency, eff_normal = eff_normal, rand_eff_25 = rand_eff_25 , rand_eff_75 = rand_eff_75))
+}
+
+no_knocks_snp = no_knocks_snp %>%
+   select(year, knockoutnum, efficiency, eff_normal, rand_eff_25 , rand_eff_75)
+
+knockout_table_snp$efficiency = knockout_table_snp$efficency
+
+knockout_2016 = knockout_table_snp %>%
+  filter(year == "2016")
+eff_2016 = no_knocks_snp %>%
+  filter(year == "2016")
+knockout_2016$eff_normal = knockout_2016$efficency/eff_2016$efficiency
+
+knockout_2017 = knockout_table_snp %>%
+  filter(year == "2017")
+eff_2017 = no_knocks_snp %>%
+  filter(year == "2017")
+knockout_2017$eff_normal = knockout_2017$efficency/eff_2017$efficiency
+
+knockout_2018 = knockout_table_snp %>%
+  filter(year == "2018")
+eff_2018 = no_knocks_snp %>%
+  filter(year == "2018")
+knockout_2018$eff_normal = knockout_2018$efficency/eff_2018$efficiency
+
+knockout_2019 = knockout_table_snp %>%
+  filter(year == "2019")
+eff_2019 = no_knocks_snp %>%
+  filter(year == "2019")
+knockout_2019$eff_normal = knockout_2019$efficency/eff_2019$efficiency
+
+knockout_2021 = knockout_table_snp %>%
+  filter(year == "2021")
+eff_2021 = no_knocks_snp %>%
+  filter(year == "2021")
+knockout_2021$eff_normal = knockout_2021$efficency/eff_2021$efficiency
+
+snp_knocks_efficency = rbind(knockout_2016, knockout_2017, knockout_2018, knockout_2019, knockout_2021)
+
+snp_knocks_efficency = snp_knocks_efficency %>%
+  select(year, knockoutnum, efficiency, eff_normal, rand_eff_25 , rand_eff_75)
+
+
+snp_eff_plot = rbind(no_knocks_snp,snp_knocks_efficency)
+
+efficency_scatterplot_snp_color <- ggplot(snp_eff_plot, aes(x = knockoutnum, y = eff_normal, group = year, color = as.factor(year))) +
+  geom_ribbon(linetype = 2, aes(ymin = rand_eff_25, ymax = rand_eff_75, fill = as.factor(year)), alpha = 0.2) +
+  geom_path(linetype = 1) +
+  scale_color_manual(values = c("2016" = "red", "2017" = "blue", "2018" = "green", "2019" = "purple", "2021" = "orange"), labels = c("2016" = "2016", "2017" = "2017", "2018" = "2018", "2019" = "2019", "2021" = "2021")) +  
+  labs(x = "Number of Knockouts", y = "Normalized Global Efficiency", color = "Year") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        text = element_text(family = "serif"))
+
+print(efficency_scatterplot_snp_color)
+ggsave("efficency_scatterplot_snp_color.svg", plot = efficency_scatterplot_snp_color)   
+ggsave("efficency_scatterplot_snp_color.png", plot = efficency_scatterplot_snp_color)  
+
+efficency_scatterplot_snp_bw <- ggplot(snp_eff_plot, aes(x = knockoutnum, y = eff_normal, group = year, linetype = as.factor(year))) +
+  geom_path(size = 1) + 
+  geom_ribbon(
+    aes(ymin = rand_eff_25, ymax = rand_eff_75, fill = as.factor(year)),
+    alpha = 0.2
+  ) +
+  scale_linetype_manual(
+    values = c("2016" = "solid", "2017" = "dashed", "2018" = "dotted", "2019" = "dotdash", "2021" = "longdash"), 
+    labels = c("2016" = "2016", "2017" = "2017", "2018" = "2018", "2019" = "2019", "2021" = "2021")
+  ) + 
+  scale_fill_manual(
+    values = c("2016" = "gray80", "2017" = "gray60", "2018" = "gray40", "2019" = "gray20", "2021" = "gray10"), 
+    labels = c("2016" = "2016", "2017" = "2017", "2018" = "2018", "2019" = "2019", "2021" = "2021")
+  ) + 
+  labs(
+    x = "Number of Knockouts", 
+    y = "Normalized Global Efficiency", 
+    linetype = "Year", 
+    fill = "Year"
+  ) + 
+  theme(
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(), 
+    axis.line = element_line(colour = "black"),
+    text = element_text(family = "serif")
+  )
+
+print(efficency_scatterplot_snp_bw)
+ggsave("efficency_scatterplot_snp_bw.svg", plot = efficency_scatterplot_snp_bw)   
+ggsave("efficency_scatterplot_snp_bw.png", plot = efficency_scatterplot_snp_bw)  
+
+
+ppp_eff_plot$site = "Pre-White-nose Syndrome"
+ppp_eff_plot$efficiency = ppp_eff_plot$efficency
+snp_eff_plot$site = "Post-White-nose Syndrome"
+snp_eff_plot$efficiency =  snp_eff_plot$efficency
+ppp_eff_plot = ppp_eff_plot %>%
+  select(year, knockoutnum, eff_normal, site,rand_eff_25,rand_eff_75)
+all_eff_plot = rbind(ppp_eff_plot, snp_eff_plot)
+
+efficency_scatterplot_all <- ggplot(all_eff_plot, aes(x = knockoutnum, y = eff_normal, group = year, color = as.factor(year), linetype = site)) + 
+   geom_ribbon(aes(ymin = rand_eff_25, ymax = rand_eff_75), alpha = 0.2) +
+  geom_path() +
+  scale_color_manual(
+  values = c(
+    "2024" = "#009E73", "2022" = "#4E79A7", "2023" = "#E15759", 
+    "2016" = "red", "2017" = "blue", "2018" = "green", 
+    "2019" = "purple", "2021" = "orange"
+  ), 
+  labels = c(
+    "2016" = "SNP 2016", "2017" = "SNP 2017", "2018" = "SNP 2018", 
+    "2019" = "SNP 2019", "2021" = "SNP 2021", 
+    "2022" = "PPP 2022", "2023" = "PPP 2023", "2024" = "PPP 2024"
+  ),
+  guide = guide_legend(override.aes = list(fill = NA, size = 1)) # Display line color only
+) +  
+  labs(x = "Number of Knockouts", y = expression("Global Efficiency"[Normal]), color = "Network", linetype = "Infection Status") +  
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"),
+        text = element_text(family = "serif")) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1.05))
+
+
+print(efficency_scatterplot_all)
+ggsave("efficency_scatterplot_all.svg", plot = efficency_scatterplot_all)   
+ggsave("efficency_scatterplot_all.tiff", 
+       plot = efficency_scatterplot_all,
+       width = 7, 
+       height = 5,  
+       dpi = 600, #resolution
+       device = "tiff")  
+
+
+```
+
+Comparing the number of brokers between pre- and post- population and the proportion of brokers, assessing signifigance
+(Table 1)
+```{r}
+##SNP
+individual_cutoff <- individual_cutoff %>%
+  mutate(reader_site3 = substr(reader_site2, 1, 2))
+
+# Define a function to process data for a given year
+# Modified process_year function
+process_year <- function(year) {
+  subset_year <- individual_cutoff %>%
+    filter(reader_site1 == "salmonier_nature_park") %>%
+    filter(reader_year == year) %>%
+    select(bat, reader_year, reader_site3) %>%
+    group_by(bat) %>%
+    mutate(
+      recorded_in_fh_and_other = reader_site3 %in% "fh" & n_distinct(reader_site3) > 1,
+      recorded_exclusively_in_fh = all(reader_site3 == "fh")
+    ) %>%
+    ungroup() %>%
+    mutate(
+      in_fh_and_another_zone = recorded_in_fh_and_other & !recorded_exclusively_in_fh
+    ) %>%
+    select(-recorded_in_fh_and_other, -recorded_exclusively_in_fh)
+  
+  # Create datasets for output
+  datafor_year <- subset_year %>%
+    select(bat, in_fh_and_another_zone) %>%
+    unique()
+  
+  unique_n_year <- subset_year %>%
+    select(bat, reader_site3) %>%
+    unique() %>%
+    group_by(bat) %>%
+    mutate(n_zone = n()) %>%
+    select(bat, n_zone) %>%
+    unique()
+  
+  # Summarize the data
+  in_fh_and_another_zone_table <- table(datafor_year$in_fh_and_another_zone)
+  n_zone_table <- table(unique_n_year$n_zone)
+  
+  # Extract TRUE count for in_fh_and_another_zone
+  true_count <- in_fh_and_another_zone_table["TRUE"]
+  
+  # Return a list of results for the year, including true_count
+  list(
+    year = year,
+    in_fh_and_another_zone_table = in_fh_and_another_zone_table,
+    n_zone_table = n_zone_table,
+    true_count = true_count
+  )
+}
+
+year_list <- c("2016", "2017", "2018", "2019", "2021")
+
+# Apply the function to each year in the list
+results <- lapply(year_list, process_year)
+
+snp_brokers <- data.frame(
+  area = "salmonier_nature_park",
+  year = year_list,
+  wns_status = "pre-WNS",
+  n_brokers = sapply(results, function(res) res$true_count)
+)
+
+
+##PPP
+
+# Define a function to process data for a given year
+# Modified process_year function
+process_year <- function(year) {
+  subset_year <- individual_cutoff %>%
+    filter(reader_site1 == "pinery_provincial_park") %>%
+    filter(reader_year == year) %>%
+    select(bat, reader_year, reader_site2) %>%
+    group_by(bat) %>%
+    mutate(
+      recorded_in_out = reader_site2 %in% "garys" & n_distinct(reader_site2) > 1,
+      recorded_exclusively_garys = all(reader_site2 == "garys")
+    ) %>%
+    ungroup() %>%
+    mutate(
+      in_garys_and_another_zone = recorded_in_out & !recorded_exclusively_garys
+    ) %>%
+    select(-recorded_in_out, -recorded_exclusively_garys)
+  
+  # Create datasets for output
+  datafor_year <- subset_year %>%
+    select(bat, in_garys_and_another_zone) %>%
+    unique()
+  
+  unique_n_year <- subset_year %>%
+    select(bat, reader_site2) %>%
+    unique() %>%
+    group_by(bat) %>%
+    mutate(n_zone = n()) %>%
+    select(bat, n_zone) %>%
+    unique()
+  
+  # Summarize the data
+  in_garys_and_another_zone_table <- table(datafor_year$in_garys_and_another_zone)
+  n_zone_table <- table(unique_n_year$n_zone)
+  
+  # Extract TRUE count for in_fh_and_another_zone
+  true_count <- in_garys_and_another_zone_table["TRUE"]
+  
+  # Return a list of results for the year, including true_count
+  list(
+    year = year,
+    in_garys_and_another_zone_table = in_garys_and_another_zone_table,
+    n_zone_table = n_zone_table,
+    true_count = true_count
+  )
+}
+
+year_list <- c("2022","2023","2024")
+
+# Apply the function to each year in the list
+results <- lapply(year_list, process_year)
+
+ppp_brokers <- data.frame(
+  area = "pinery_provincial_park",
+  year = year_list,
+  wns_status = "post-WNS",
+  n_brokers = sapply(results, function(res) res$true_count)
+)
+
+brokers = rbind(snp_brokers,ppp_brokers)
+brokers$reader_year = as.numeric(brokers$year)
+brokers = cbind(brokers, summary_stats)
+brokers = brokers %>%
+  select(area, year, wns_status,n_brokers, network_size)%>%
+  mutate(prop_broker = n_brokers/network_size) 
+
+print(brokers) # dataframe with number of brokers as defined by number of bats connecting most distant roost groups
+
+# Perform the Mann-Whitney U test to generate a p-value for comparison between pre and post wns
+snp_brokers = brokers %>%
+  filter(area == "salmonier_nature_park") 
+ppp_brokers = brokers %>%
+  filter(area == "pinery_provincial_park") 
+
+test_result_prop <- wilcox.test(as.numeric(snp_brokers$prop_broker), as.numeric(ppp_brokers$prop_broker))
+test_result_count <- wilcox.test(snp_brokers$n_brokers, ppp_brokers$n_brokers)
+
+# Print results
+print(test_result_prop)
+print(test_result_count)
+```
+
